@@ -1,0 +1,1329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<title>Cosmic Synth Playground</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;user-select:none;-webkit-user-select:none}
+#c{display:block;width:100vw;height:100vh;touch-action:none}
+#hud{position:fixed;top:16px;left:16px;pointer-events:none;color:#fff;font-family:'Courier New',monospace;font-size:13px;z-index:10;opacity:0.85}
+#wave-mode{font-size:16px;font-weight:bold;text-shadow:0 0 8px currentColor;margin-bottom:8px}
+#wave-mode.sine{color:#0ff}
+#wave-mode.saw{color:#f80}
+#wave-mode.tri{color:#0f8}
+#vu-container{width:8px;height:64px;background:rgba(255,255,255,0.08);border-radius:4px;overflow:hidden;position:relative;margin-bottom:10px}
+#vu-meter{position:absolute;bottom:0;width:100%;background:linear-gradient(to top,#0c0,#ff0 60%,#f00);border-radius:4px;transition:height 60ms linear}
+#rec-indicator{color:#f22;font-weight:bold;display:none;animation:pulse 0.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+#hints{margin-top:12px;font-size:11px;color:rgba(255,255,255,0.5);line-height:1.6;transition:opacity 1.5s ease}
+#fallback{display:none;position:fixed;inset:0;background:#111;color:#aaa;font-family:sans-serif;font-size:18px;align-items:center;justify-content:center;text-align:center;padding:40px;z-index:100}
+#fallback.show{display:flex}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="wave-mode" class="sine">&#x223F; SINE</div>
+  <div id="vu-container"><div id="vu-meter"></div></div>
+  <div id="rec-indicator">&#9679; REC</div>
+  <div id="hints">
+    1/2/3 Wave &middot; Space Drone &middot; R Record<br>
+    C Clear &middot; Scroll Zoom &middot; Right-click Attractor
+  </div>
+</div>
+<div id="fallback">WebGL2 is required to run Cosmic Synth Playground.<br>Please use a modern browser.</div>
+
+<script>
+'use strict';
+/* ====================================================================
+   COSMIC SYNTH PLAYGROUND
+   Interactive audiovisual synthesizer — zero dependencies
+   ==================================================================== */
+
+// ─── Constants ──────────────────────────────────────────────────────
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (('ontouchstart' in window) && window.innerWidth < 1024);
+const MAX_PARTICLES = isMobile ? 50000 : 100000;
+const PARTICLE_STRIDE = 36; // bytes
+const PARTICLE_FLOATS = 9;  // 36/4
+const MAX_VOICES = 8;
+const MAX_ATTRACTORS = 4;
+const BLOOM_LEVELS = isMobile ? 2 : 4;
+const MAX_DPR = isMobile ? 1.5 : 2.0;
+const PENTATONIC = [];
+for (let oct = 0; oct < 4; oct++) {
+  [0,2,4,7,9].forEach(s => PENTATONIC.push(36 + oct*12 + s));
+}
+function midiToFreq(m){ return 440 * Math.pow(2, (m-69)/12); }
+
+// ─── GLSL Snippets ──────────────────────────────────────────────────
+
+const NOISE_GLSL = `
+vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 permute(vec4 x){return mod289(((x*34.0)+10.0)*x);}
+vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+float snoise(vec3 v){
+  const vec2 C=vec2(1.0/6.0,1.0/3.0);
+  const vec4 D=vec4(0.0,0.5,1.0,2.0);
+  vec3 i=floor(v+dot(v,C.yyy));
+  vec3 x0=v-i+dot(i,C.xxx);
+  vec3 g=step(x0.yzx,x0.xyz);
+  vec3 l=1.0-g;
+  vec3 i1=min(g.xyz,l.zxy);
+  vec3 i2=max(g.xyz,l.zxy);
+  vec3 x1=x0-i1+C.xxx;
+  vec3 x2=x0-i2+C.yyy;
+  vec3 x3=x0-D.yyy;
+  i=mod289(i);
+  vec4 p=permute(permute(permute(
+    i.z+vec4(0.0,i1.z,i2.z,1.0))
+    +i.y+vec4(0.0,i1.y,i2.y,1.0))
+    +i.x+vec4(0.0,i1.x,i2.x,1.0));
+  float n_=0.142857142857;
+  vec3 ns=n_*D.wyz-D.xzx;
+  vec4 j=p-49.0*floor(p*ns.z*ns.z);
+  vec4 x_=floor(j*ns.z);
+  vec4 y_=floor(j-7.0*x_);
+  vec4 x=x_*ns.x+ns.yyyy;
+  vec4 y=y_*ns.x+ns.yyyy;
+  vec4 h=1.0-abs(x)-abs(y);
+  vec4 b0=vec4(x.xy,y.xy);
+  vec4 b1=vec4(x.zw,y.zw);
+  vec4 s0=floor(b0)*2.0+1.0;
+  vec4 s1=floor(b1)*2.0+1.0;
+  vec4 sh=-step(h,vec4(0.0));
+  vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy;
+  vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+  vec3 p0=vec3(a0.xy,h.x);
+  vec3 p1=vec3(a0.zw,h.y);
+  vec3 p2=vec3(a1.xy,h.z);
+  vec3 p3=vec3(a1.zw,h.w);
+  vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+  p0*=norm.x; p1*=norm.y; p2*=norm.z; p3*=norm.w;
+  vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0);
+  m=m*m;
+  return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+}
+`;
+
+const HSV_GLSL = `
+vec3 hsv2rgb(vec3 c){
+  vec4 K=vec4(1.0,2.0/3.0,1.0/3.0,3.0);
+  vec3 p=abs(fract(c.xxx+K.xyz)*6.0-K.www);
+  return c.z*mix(K.xxx,clamp(p-K.xxx,0.0,1.0),c.y);
+}
+`;
+
+const HASH_GLSL = `
+float hash(float n){return fract(sin(n)*43758.5453123);}
+vec2 hash2(float n){return vec2(hash(n),hash(n+7.13));}
+`;
+
+// ─── Fullscreen triangle VS (shared) ────────────────────────────────
+const FULLSCREEN_VS = `#version 300 es
+out vec2 v_uv;
+void main(){
+  float x=float((gl_VertexID&1)<<2)-1.0;
+  float y=float((gl_VertexID&2)<<1)-1.0;
+  v_uv=vec2(x,y)*0.5+0.5;
+  gl_Position=vec4(x,y,0.0,1.0);
+}`;
+
+// ─── Particle Update VS ─────────────────────────────────────────────
+const PARTICLE_UPDATE_VS = `#version 300 es
+precision highp float;
+` + NOISE_GLSL + HSV_GLSL + HASH_GLSL + `
+layout(location=0) in vec2 a_position;
+layout(location=1) in vec2 a_velocity;
+layout(location=2) in vec4 a_color;
+layout(location=3) in float a_life;
+out vec2 v_position;
+out vec2 v_velocity;
+out vec4 v_color;
+out float v_life;
+uniform float u_dt;
+uniform float u_time;
+uniform vec2 u_emitters[8];
+uniform vec2 u_emitterVels[8];
+uniform int u_numEmitters;
+uniform float u_rms;
+uniform float u_bass;
+uniform float u_implosion;
+uniform int u_waveMode;
+uniform vec2 u_attractors[4];
+uniform float u_attractorStrengths[4];
+uniform sampler2D u_spectrum;
+
+vec2 curlNoise(vec2 p, float t){
+  float e=0.01;
+  float a=snoise(vec3(p.x,p.y+e,t));
+  float b=snoise(vec3(p.x,p.y-e,t));
+  float c=snoise(vec3(p.x+e,p.y,t));
+  float d=snoise(vec3(p.x-e,p.y,t));
+  return vec2((a-b)/(2.0*e),-(c-d)/(2.0*e));
+}
+
+void main(){
+  float life=a_life-u_dt;
+  float id=float(gl_VertexID);
+  float seed=id*1.731+u_time*3.7;
+
+  if(life<=0.0 && u_numEmitters>0){
+    // Respawn at random emitter
+    int emIdx=min(int(hash(seed)*float(u_numEmitters)),u_numEmitters-1);
+    vec2 emPos=u_emitters[emIdx];
+    vec2 emVel=u_emitterVels[emIdx];
+    vec2 rnd=hash2(seed+100.0)*2.0-1.0;
+    v_position=emPos+rnd*0.025;
+    vec2 rndVel=normalize(hash2(seed+200.0)*2.0-1.0+emVel*0.3);
+    float spd=0.15+hash(seed+300.0)*0.35;
+    v_velocity=rndVel*spd;
+    // Color
+    float hueBase=u_waveMode==0?0.55:u_waveMode==1?0.05:0.3;
+    float hue=hueBase+hash(seed+400.0)*0.25-0.125;
+    float sat=0.65+hash(seed+500.0)*0.35;
+    float val=0.8+hash(seed+600.0)*0.2;
+    v_color=vec4(hsv2rgb(vec3(hue,sat,val)),1.0);
+    v_life=2.0+hash(seed+700.0)*3.5;
+  } else if(life<=0.0){
+    v_position=vec2(0.0);
+    v_velocity=vec2(0.0);
+    v_color=vec4(0.0);
+    v_life=0.0;
+  } else {
+    vec2 pos=a_position;
+    vec2 vel=a_velocity;
+    // Curl noise force
+    vec2 noiseF=curlNoise(pos*1.5,u_time*0.3)*0.8;
+    vel+=noiseF*u_dt;
+    // Drag
+    vel*=1.0-1.5*u_dt;
+    // Attractors
+    for(int i=0;i<4;i++){
+      if(u_attractorStrengths[i]<0.001) continue;
+      vec2 toA=u_attractors[i]-pos;
+      float dist=length(toA);
+      if(dist>0.005){
+        // Orbital: tangent + radial
+        vec2 radial=normalize(toA);
+        vec2 tangent=vec2(-radial.y,radial.x);
+        float force=u_attractorStrengths[i]/(dist*dist+0.08);
+        vel+=radial*force*u_dt*0.5;
+        vel+=tangent*force*u_dt*0.3;
+      }
+    }
+    // Implosion
+    if(u_implosion>0.01){
+      float d=length(pos);
+      if(d>0.005) vel-=normalize(pos)*u_implosion*2.0*u_dt;
+      life-=u_dt*3.0*u_implosion;
+    }
+    // Spectrum modulation
+    float freqBin=clamp(length(pos)*0.3+0.05,0.0,1.0);
+    float specVal=texture(u_spectrum,vec2(freqBin,0.5)).r;
+    vel*=1.0+specVal*0.15;
+    pos+=vel*u_dt;
+    // Keep color, modulate brightness with bass
+    vec3 col=a_color.rgb*(1.0+u_bass*0.4);
+    // Shift hue slightly with spectrum
+    col=mix(col,col.gbr,specVal*0.15);
+    v_position=pos;
+    v_velocity=vel;
+    v_color=vec4(col,a_color.a);
+    v_life=life;
+  }
+}`;
+
+const PARTICLE_UPDATE_FS = `#version 300 es
+precision lowp float;
+out vec4 o;
+void main(){o=vec4(0.0);}`;
+
+// ─── Particle Render VS ─────────────────────────────────────────────
+const PARTICLE_RENDER_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 a_position;
+layout(location=1) in vec2 a_velocity;
+layout(location=2) in vec4 a_color;
+layout(location=3) in float a_life;
+uniform float u_zoom;
+uniform vec2 u_resolution;
+uniform float u_bass;
+out vec4 v_color;
+out float v_life;
+void main(){
+  if(a_life<=0.0){
+    gl_Position=vec4(2.0,2.0,2.0,1.0);
+    gl_PointSize=0.0;
+    v_color=vec4(0.0);
+    v_life=0.0;
+    return;
+  }
+  float aspect=u_resolution.x/u_resolution.y;
+  vec2 pos=a_position*u_zoom;
+  pos.x/=aspect;
+  gl_Position=vec4(pos,0.0,1.0);
+  float lifeAlpha=smoothstep(0.0,0.3,a_life)*smoothstep(5.5,3.0,a_life);
+  gl_PointSize=(2.0+lifeAlpha*5.0)*(1.0+u_bass*1.2)*min(u_zoom,2.5);
+  gl_PointSize=clamp(gl_PointSize,1.0,40.0);
+  v_color=a_color*lifeAlpha;
+  v_life=a_life;
+}`;
+
+// ─── Particle Render FS ──────────────────────────────────────────────
+const PARTICLE_RENDER_FS = `#version 300 es
+precision highp float;
+in vec4 v_color;
+in float v_life;
+uniform int u_waveMode;
+out vec4 fragColor;
+void main(){
+  vec2 pc=gl_PointCoord*2.0-1.0;
+  float alpha;
+  if(u_waveMode==0){
+    alpha=1.0-smoothstep(0.4,1.0,length(pc));
+  } else if(u_waveMode==1){
+    alpha=1.0-smoothstep(0.5,1.0,abs(pc.x)+abs(pc.y));
+  } else {
+    float d=max(abs(pc.x)*0.866+pc.y*0.5,-pc.y*0.5+0.25);
+    alpha=1.0-smoothstep(0.3,0.8,d);
+  }
+  if(alpha<0.01) discard;
+  fragColor=vec4(v_color.rgb*alpha,alpha);
+}`;
+
+// ─── Nebula FS ───────────────────────────────────────────────────────
+const NEBULA_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+` + NOISE_GLSL + `
+uniform float u_time;
+uniform vec2 u_resolution;
+uniform float u_rms;
+uniform float u_dominantFreq;
+out vec4 fragColor;
+
+float fbm(vec3 p){
+  float f=0.0,amp=0.5;
+  for(int i=0;i<5;i++){f+=amp*snoise(p);p*=2.03;amp*=0.48;}
+  return f;
+}
+float warpFBM(vec3 p){
+  vec3 q=vec3(fbm(p+vec3(0.0)),fbm(p+vec3(5.2,1.3,0.0)),0.0);
+  vec3 r=vec3(fbm(p+4.0*q+vec3(1.7,9.2,0.0)),fbm(p+4.0*q+vec3(8.3,2.8,0.0)),0.0);
+  return fbm(p+3.5*r);
+}
+void main(){
+  vec2 uv=v_uv*2.0-1.0;
+  uv.x*=u_resolution.x/u_resolution.y;
+  float t=u_time*0.04;
+  float n=warpFBM(vec3(uv*1.2,t));
+  float n2=warpFBM(vec3(uv*0.8+3.0,t*0.7));
+  vec3 col1=vec3(0.03,0.01,0.08);
+  vec3 col2=vec3(0.12,0.02,0.18);
+  vec3 col3=vec3(0.02,0.06,0.15);
+  vec3 col=mix(col1,col2,smoothstep(-0.3,0.5,n));
+  col=mix(col,col3,smoothstep(-0.2,0.6,n2)*0.5);
+  col*=1.0+u_rms*0.6;
+  float shift=u_dominantFreq*0.3;
+  col=mix(col,vec3(col.g,col.b,col.r),shift);
+  fragColor=vec4(max(col,0.0),1.0);
+}`;
+
+// ─── Trail FS ────────────────────────────────────────────────────────
+const TRAIL_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_prevTrail;
+uniform sampler2D u_scene;
+uniform float u_decay;
+out vec4 fragColor;
+void main(){
+  vec2 texel=1.0/vec2(textureSize(u_prevTrail,0));
+  vec4 trail=vec4(0.0);
+  for(int x=-1;x<=1;x++){
+    for(int y=-1;y<=1;y++){
+      trail+=texture(u_prevTrail,v_uv+vec2(float(x),float(y))*texel);
+    }
+  }
+  trail/=9.0;
+  vec4 scene=texture(u_scene,v_uv);
+  fragColor=trail*u_decay+scene;
+}`;
+
+// ─── Bloom Downsample FS ─────────────────────────────────────────────
+const BLOOM_DOWN_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_source;
+uniform float u_threshold;
+uniform bool u_applyThreshold;
+out vec4 fragColor;
+void main(){
+  vec4 col=texture(u_source,v_uv);
+  if(u_applyThreshold){
+    float br=dot(col.rgb,vec3(0.2126,0.7152,0.0722));
+    col.rgb*=smoothstep(u_threshold,u_threshold+0.5,br);
+  }
+  fragColor=col;
+}`;
+
+// ─── Bloom Blur FS ───────────────────────────────────────────────────
+const BLOOM_BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_source;
+uniform vec2 u_direction;
+out vec4 fragColor;
+void main(){
+  float w[5]=float[](0.227027,0.1945946,0.1216216,0.054054,0.016216);
+  vec4 result=texture(u_source,v_uv)*w[0];
+  for(int i=1;i<5;i++){
+    vec2 off=u_direction*float(i);
+    result+=texture(u_source,v_uv+off)*w[i];
+    result+=texture(u_source,v_uv-off)*w[i];
+  }
+  fragColor=result;
+}`;
+
+// ─── Composite FS ────────────────────────────────────────────────────
+const COMPOSITE_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_trail;
+uniform sampler2D u_bloom0;
+uniform sampler2D u_bloom1;
+uniform sampler2D u_bloom2;
+uniform sampler2D u_bloom3;
+uniform float u_caStrength;
+uniform int u_bloomLevels;
+out vec4 fragColor;
+
+vec3 ACESFilm(vec3 x){
+  float a=2.51,b=0.03,c=2.43,d=0.59,e=0.14;
+  return clamp((x*(a*x+b))/(x*(c*x+d)+e),0.0,1.0);
+}
+
+void main(){
+  vec2 dir=v_uv-0.5;
+  float d=length(dir);
+  vec2 caOff=dir*d*u_caStrength;
+  float r=texture(u_trail,v_uv+caOff).r;
+  float g=texture(u_trail,v_uv).g;
+  float b=texture(u_trail,v_uv-caOff).b;
+  vec3 col=vec3(r,g,b);
+  float bloomW[4]=float[](0.5,0.3,0.2,0.1);
+  if(u_bloomLevels>0) col+=texture(u_bloom0,v_uv).rgb*bloomW[0];
+  if(u_bloomLevels>1) col+=texture(u_bloom1,v_uv).rgb*bloomW[1];
+  if(u_bloomLevels>2) col+=texture(u_bloom2,v_uv).rgb*bloomW[2];
+  if(u_bloomLevels>3) col+=texture(u_bloom3,v_uv).rgb*bloomW[3];
+  col=ACESFilm(col);
+  float vignette=1.0-d*d*1.8;
+  col*=max(vignette,0.0);
+  col=pow(col,vec3(1.0/2.2));
+  fragColor=vec4(col,1.0);
+}`;
+
+// ─── Global State ────────────────────────────────────────────────────
+let canvas, gl;
+let time = 0, lastTime = 0;
+let waveMode = 0; // 0=sine, 1=saw, 2=tri
+let zoom = 1.0;
+let implosionAmount = 0;
+let droneActive = false;
+let recording = false, playing = false;
+let recordData = [], recordStart = 0, playbackStart = 0;
+let ghostEmitter = null;
+
+// Pointers: pointerId -> {x, y, vx, vy, active, voiceIdx, prevX, prevY, speed}
+const pointers = new Map();
+// Attractors: [{x, y, strength, life, maxLife}]
+const attractors = [];
+// Audio
+let audioCtx = null, audioReady = false;
+let analyser, frequencyData, timeDomainData;
+let voiceMixer, dryGain, reverbNode, reverbWet, delayNode, delayFeedback, compressor;
+let rms = 0, bass = 0, dominantFreq = 0;
+const voices = [];
+let droneNodes = [];
+// GL objects
+let particleUpdateProg, particleRenderProg, nebulaProg, trailProg, bloomDownProg, bloomBlurProg, compositeProg;
+let particleUpdateUnis = {}, particleRenderUnis = {}, nebulaUnis = {}, trailUnis = {}, bloomDownUnis = {}, bloomBlurUnis = {}, compositeUnis = {};
+let particleBuffers = [], particleVaos = [], tfObj;
+let emptyVao;
+let tfRead = 0;
+let spectrumTexture;
+let fbScene, trailFBOs = [], trailIdx = 0;
+let bloomDownFBOs = [], bloomBlurFBOs = [];
+let hasFloat = false;
+let dummyTexture;
+const emitterPositions = new Float32Array(16);
+const emitterVelocities = new Float32Array(16);
+const attractorPositions = new Float32Array(8);
+const attractorStrengths = new Float32Array(4);
+
+// ─── GL Utilities ────────────────────────────────────────────────────
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error('Shader compile error:', gl.getShaderInfoLog(s), '\n', src.split('\n').map((l,i)=>(i+1)+': '+l).join('\n'));
+    gl.deleteShader(s);
+    return null;
+  }
+  return s;
+}
+
+function createProgram(vsSrc, fsSrc, tfVaryings) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  if (!vs || !fs) return null;
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  if (tfVaryings) {
+    gl.transformFeedbackVaryings(p, tfVaryings, gl.INTERLEAVED_ATTRIBS);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error('Program link error:', gl.getProgramInfoLog(p));
+    return null;
+  }
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  return p;
+}
+
+function getUniforms(prog, names) {
+  const u = {};
+  for (const n of names) u[n] = gl.getUniformLocation(prog, n);
+  return u;
+}
+
+function createFBO(w, h) {
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  const fmt = hasFloat ? gl.RGBA16F : gl.RGBA8;
+  const tp = hasFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+  gl.texImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, gl.RGBA, tp, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fbo, texture: tex, width: w, height: h };
+}
+
+// ─── Audio Engine ────────────────────────────────────────────────────
+function initAudio() {
+  if (audioReady) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) { console.warn('No AudioContext support'); return; }
+  try {
+    audioCtx = new AC();
+  } catch(e) { console.warn('AudioContext creation failed:', e); return; }
+
+  // Nodes
+  voiceMixer = audioCtx.createGain();
+  voiceMixer.gain.value = 1.0;
+  dryGain = audioCtx.createGain();
+  dryGain.gain.value = 0.7;
+  compressor = audioCtx.createDynamicsCompressor();
+  compressor.threshold.value = -18;
+  compressor.ratio.value = 6;
+  compressor.attack.value = 0.003;
+  compressor.release.value = 0.15;
+
+  // Reverb
+  reverbNode = audioCtx.createConvolver();
+  const irLen = audioCtx.sampleRate * 2.5;
+  const irBuf = audioCtx.createBuffer(2, irLen, audioCtx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = irBuf.getChannelData(ch);
+    for (let i = 0; i < irLen; i++) {
+      d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (audioCtx.sampleRate * 0.5));
+    }
+  }
+  reverbNode.buffer = irBuf;
+  reverbWet = audioCtx.createGain();
+  reverbWet.gain.value = 0.3;
+
+  // Delay
+  delayNode = audioCtx.createDelay(1.0);
+  delayNode.delayTime.value = 0.375;
+  delayFeedback = audioCtx.createGain();
+  delayFeedback.gain.value = 0.35;
+  const delayWet = audioCtx.createGain();
+  delayWet.gain.value = 0.25;
+
+  // Analyser
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  analyser.smoothingTimeConstant = 0.8;
+  frequencyData = new Uint8Array(analyser.frequencyBinCount);
+  timeDomainData = new Float32Array(analyser.fftSize);
+
+  // Routing
+  voiceMixer.connect(dryGain);
+  dryGain.connect(compressor);
+  voiceMixer.connect(reverbNode);
+  reverbNode.connect(reverbWet);
+  reverbWet.connect(compressor);
+  voiceMixer.connect(delayNode);
+  delayNode.connect(delayFeedback);
+  delayFeedback.connect(delayNode);
+  delayNode.connect(delayWet);
+  delayWet.connect(compressor);
+  voiceMixer.connect(analyser);
+  compressor.connect(audioCtx.destination);
+
+  // Create voices
+  for (let i = 0; i < MAX_VOICES; i++) {
+    const osc = audioCtx.createOscillator();
+    const filter = audioCtx.createBiquadFilter();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = 220;
+    filter.type = 'lowpass';
+    filter.frequency.value = 2000;
+    filter.Q.value = 1;
+    gain.gain.value = 0;
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(voiceMixer);
+    osc.start();
+    voices.push({ osc, filter, gain, active: false, pointerId: null });
+  }
+  audioReady = true;
+}
+
+function allocateVoice(pointerId) {
+  // Find existing voice for this pointer
+  for (const v of voices) {
+    if (v.active && v.pointerId === pointerId) return v;
+  }
+  // Find free voice
+  for (const v of voices) {
+    if (!v.active) {
+      v.active = true;
+      v.pointerId = pointerId;
+      return v;
+    }
+  }
+  return null;
+}
+
+function releaseVoice(pointerId) {
+  for (const v of voices) {
+    if (v.pointerId === pointerId) {
+      const t = audioCtx.currentTime;
+      v.gain.gain.setTargetAtTime(0, t, 0.08);
+      v.active = false;
+      v.pointerId = null;
+    }
+  }
+}
+
+function updateVoice(voice, nx, ny, speed) {
+  if (!audioReady || !voice) return;
+  const t = audioCtx.currentTime;
+  // Y -> pitch (pentatonic)
+  const yNorm = (ny + 1) * 0.5; // 0..1
+  const noteIdx = Math.round(yNorm * (PENTATONIC.length - 1));
+  const freq = midiToFreq(PENTATONIC[Math.max(0, Math.min(PENTATONIC.length - 1, noteIdx))]);
+  // X -> filter cutoff + reverb
+  const xNorm = (nx + 1) * 0.5;
+  const cutoff = 200 + xNorm * 8000;
+  const Q = 0.5 + Math.min(speed, 1) * 11.5;
+  // Speed -> volume
+  const vol = 0.05 + Math.min(speed, 1) * 0.55;
+  const waveTypes = ['sine', 'sawtooth', 'triangle'];
+  voice.osc.type = waveTypes[waveMode];
+  voice.osc.frequency.setTargetAtTime(freq, t, 0.03);
+  voice.filter.frequency.setTargetAtTime(cutoff, t, 0.03);
+  voice.filter.Q.setTargetAtTime(Q, t, 0.03);
+  voice.gain.gain.setTargetAtTime(vol, t, 0.03);
+  // Reverb wet
+  if (reverbWet) reverbWet.gain.setTargetAtTime(0.1 + xNorm * 0.5, t, 0.05);
+}
+
+function analyzeAudio() {
+  if (!audioReady) { rms = 0; bass = 0; dominantFreq = 0; return; }
+  analyser.getByteFrequencyData(frequencyData);
+  analyser.getFloatTimeDomainData(timeDomainData);
+  // RMS
+  let sum = 0;
+  for (let i = 0; i < timeDomainData.length; i++) sum += timeDomainData[i] * timeDomainData[i];
+  rms = Math.sqrt(sum / timeDomainData.length);
+  rms = Math.min(rms * 2.5, 1.0);
+  // Bass (bins 0-9)
+  let bassSum = 0;
+  for (let i = 0; i < 10; i++) bassSum += frequencyData[i];
+  bass = bassSum / (10 * 255);
+  // Dominant freq
+  let maxVal = 0, maxBin = 0;
+  for (let i = 0; i < frequencyData.length; i++) {
+    if (frequencyData[i] > maxVal) { maxVal = frequencyData[i]; maxBin = i; }
+  }
+  dominantFreq = maxBin / frequencyData.length;
+}
+
+function toggleDrone() {
+  if (!audioReady) return;
+  if (droneActive) {
+    const t = audioCtx.currentTime;
+    for (const dn of droneNodes) {
+      dn.gain.gain.setTargetAtTime(0, t, 0.5);
+      dn.osc.stop(t + 2);
+      dn.lfo.stop(t + 2);
+    }
+    droneNodes = [];
+    droneActive = false;
+  } else {
+    const freqs = [65.41, 130.81, 98.00, 261.63];
+    const t = audioCtx.currentTime;
+    droneNodes = freqs.map(f => {
+      const osc = audioCtx.createOscillator();
+      const filter = audioCtx.createBiquadFilter();
+      const gain = audioCtx.createGain();
+      const lfo = audioCtx.createOscillator();
+      const lfoGain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      filter.type = 'lowpass';
+      filter.frequency.value = 350;
+      gain.gain.value = 0;
+      gain.gain.setTargetAtTime(0.07, t, 0.6);
+      lfo.type = 'sine';
+      lfo.frequency.value = 0.08 + Math.random() * 0.2;
+      lfoGain.gain.value = f * 0.008;
+      lfo.connect(lfoGain);
+      lfoGain.connect(osc.detune);
+      // LFO on filter too
+      const lfoFilter = audioCtx.createGain();
+      lfoFilter.gain.value = 200;
+      lfo.connect(lfoFilter);
+      lfoFilter.connect(filter.frequency);
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(voiceMixer);
+      osc.start();
+      lfo.start();
+      return { osc, filter, gain, lfo, lfoGain };
+    });
+    droneActive = true;
+  }
+}
+
+// ─── WebGL Initialization ────────────────────────────────────────────
+function initGL() {
+  canvas = document.getElementById('c');
+  gl = canvas.getContext('webgl2', {
+    powerPreference: 'high-performance',
+    alpha: false,
+    antialias: false,
+    preserveDrawingBuffer: false
+  });
+  if (!gl) {
+    document.getElementById('fallback').classList.add('show');
+    document.getElementById('hud').style.display = 'none';
+    return false;
+  }
+  hasFloat = !!gl.getExtension('EXT_color_buffer_float');
+  gl.getExtension('OES_texture_float_linear');
+  handleResize();
+  window.addEventListener('resize', handleResize);
+  return true;
+}
+
+function handleResize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+  const w = Math.floor(window.innerWidth * dpr);
+  const h = Math.floor(window.innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    initFramebuffers();
+  }
+}
+
+function initShaders() {
+  // 1. Particle update (transform feedback)
+  particleUpdateProg = createProgram(PARTICLE_UPDATE_VS, PARTICLE_UPDATE_FS,
+    ['v_position', 'v_velocity', 'v_color', 'v_life']);
+  particleUpdateUnis = getUniforms(particleUpdateProg, [
+    'u_dt','u_time','u_emitters','u_emitterVels','u_numEmitters',
+    'u_rms','u_bass','u_implosion','u_waveMode',
+    'u_attractors','u_attractorStrengths','u_spectrum'
+  ]);
+
+  // 2. Particle render
+  particleRenderProg = createProgram(PARTICLE_RENDER_VS, PARTICLE_RENDER_FS);
+  particleRenderUnis = getUniforms(particleRenderProg, [
+    'u_zoom','u_resolution','u_bass','u_waveMode'
+  ]);
+
+  // 3. Nebula
+  nebulaProg = createProgram(FULLSCREEN_VS, NEBULA_FS);
+  nebulaUnis = getUniforms(nebulaProg, [
+    'u_time','u_resolution','u_rms','u_dominantFreq'
+  ]);
+
+  // 4. Trail
+  trailProg = createProgram(FULLSCREEN_VS, TRAIL_FS);
+  trailUnis = getUniforms(trailProg, ['u_prevTrail','u_scene','u_decay']);
+
+  // 5. Bloom downsample
+  bloomDownProg = createProgram(FULLSCREEN_VS, BLOOM_DOWN_FS);
+  bloomDownUnis = getUniforms(bloomDownProg, ['u_source','u_threshold','u_applyThreshold']);
+
+  // 6. Bloom blur
+  bloomBlurProg = createProgram(FULLSCREEN_VS, BLOOM_BLUR_FS);
+  bloomBlurUnis = getUniforms(bloomBlurProg, ['u_source','u_direction']);
+
+  // 7. Composite
+  compositeProg = createProgram(FULLSCREEN_VS, COMPOSITE_FS);
+  compositeUnis = getUniforms(compositeProg, [
+    'u_trail','u_bloom0','u_bloom1','u_bloom2','u_bloom3','u_caStrength','u_bloomLevels'
+  ]);
+
+  // Empty VAO for fullscreen triangle
+  emptyVao = gl.createVertexArray();
+
+  // 1x1 black dummy texture for unused sampler slots
+  dummyTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, dummyTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,0,0,0]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+}
+
+function setupParticleAttribs(buf) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  // position vec2 @ 0
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, PARTICLE_STRIDE, 0);
+  // velocity vec2 @ 8
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 2, gl.FLOAT, false, PARTICLE_STRIDE, 8);
+  // color vec4 @ 16
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, PARTICLE_STRIDE, 16);
+  // life float @ 32
+  gl.enableVertexAttribArray(3);
+  gl.vertexAttribPointer(3, 1, gl.FLOAT, false, PARTICLE_STRIDE, 32);
+}
+
+function initParticles() {
+  const initData = new Float32Array(MAX_PARTICLES * PARTICLE_FLOATS);
+  for (let i = 0; i < 2; i++) {
+    particleBuffers[i] = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, particleBuffers[i]);
+    gl.bufferData(gl.ARRAY_BUFFER, initData, gl.DYNAMIC_COPY);
+    particleVaos[i] = gl.createVertexArray();
+    gl.bindVertexArray(particleVaos[i]);
+    setupParticleAttribs(particleBuffers[i]);
+  }
+  gl.bindVertexArray(null);
+  tfObj = gl.createTransformFeedback();
+
+  // Spectrum texture
+  spectrumTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, spectrumTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 256, 1, 0, gl.RED, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function initFramebuffers() {
+  const w = canvas.width, h = canvas.height;
+
+  // Clean up old FBOs
+  function deleteFBO(fb) {
+    if (!fb) return;
+    gl.deleteTexture(fb.texture);
+    gl.deleteFramebuffer(fb.fbo);
+  }
+  deleteFBO(fbScene);
+  trailFBOs.forEach(deleteFBO);
+  bloomDownFBOs.forEach(deleteFBO);
+  bloomBlurFBOs.forEach(deleteFBO);
+
+  // Scene FBO
+  fbScene = createFBO(w, h);
+
+  // Trail ping-pong
+  trailFBOs = [createFBO(w, h), createFBO(w, h)];
+  // Clear trail FBOs
+  for (const tb of trailFBOs) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, tb.fbo);
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  trailIdx = 0;
+
+  // Bloom FBOs
+  bloomDownFBOs = [];
+  bloomBlurFBOs = [];
+  let bw = Math.floor(w / 2), bh = Math.floor(h / 2);
+  for (let i = 0; i < BLOOM_LEVELS; i++) {
+    bloomDownFBOs.push(createFBO(bw, bh));
+    bloomBlurFBOs.push(createFBO(bw, bh));
+    bw = Math.max(1, Math.floor(bw / 2));
+    bh = Math.max(1, Math.floor(bh / 2));
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// ─── Input Handling ──────────────────────────────────────────────────
+function screenToParticle(ex, ey) {
+  const cw = canvas.clientWidth || 1;
+  const ch = canvas.clientHeight || 1;
+  const aspect = cw / ch;
+  const nx = ((ex / cw) * 2 - 1) * aspect / zoom;
+  const ny = (1 - (ey / ch) * 2) / zoom;
+  return { x: nx, y: ny };
+}
+
+function setupInput() {
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  canvas.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);
+    // Init audio on first gesture
+    if (!audioReady) initAudio();
+    if (audioReady && audioCtx.state === 'suspended') audioCtx.resume();
+
+    // Right-click = attractor
+    if (e.button === 2) {
+      const p = screenToParticle(e.clientX, e.clientY);
+      if (attractors.length < MAX_ATTRACTORS) {
+        attractors.push({ x: p.x, y: p.y, strength: 2.0, life: 8.0, maxLife: 8.0 });
+      }
+      return;
+    }
+
+    const p = screenToParticle(e.clientX, e.clientY);
+    const ptr = { x: p.x, y: p.y, prevX: p.x, prevY: p.y, vx: 0, vy: 0, speed: 0, active: true, voiceIdx: -1 };
+    pointers.set(e.pointerId, ptr);
+
+    // Allocate voice
+    if (audioReady) {
+      const v = allocateVoice(e.pointerId);
+      if (v) updateVoice(v, p.x, p.y, 0.1);
+    }
+  });
+
+  canvas.addEventListener('pointermove', e => {
+    const ptr = pointers.get(e.pointerId);
+    if (!ptr || !ptr.active) return;
+    const p = screenToParticle(e.clientX, e.clientY);
+    ptr.prevX = ptr.x;
+    ptr.prevY = ptr.y;
+    ptr.x = p.x;
+    ptr.y = p.y;
+    ptr.vx = p.x - ptr.prevX;
+    ptr.vy = p.y - ptr.prevY;
+    ptr.speed = Math.sqrt(ptr.vx * ptr.vx + ptr.vy * ptr.vy) * 60; // per frame approx
+
+    if (audioReady) {
+      const v = allocateVoice(e.pointerId);
+      if (v) updateVoice(v, p.x, p.y, ptr.speed);
+    }
+  });
+
+  const pointerUp = e => {
+    const ptr = pointers.get(e.pointerId);
+    if (ptr) {
+      ptr.active = false;
+      pointers.delete(e.pointerId);
+      if (audioReady) releaseVoice(e.pointerId);
+    }
+  };
+  canvas.addEventListener('pointerup', pointerUp);
+  canvas.addEventListener('pointercancel', pointerUp);
+
+  // Scroll zoom
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    zoom *= Math.pow(1.1, -e.deltaY / 100);
+    zoom = Math.max(0.2, Math.min(5.0, zoom));
+  }, { passive: false });
+
+  // Keyboard
+  window.addEventListener('keydown', e => {
+    if (e.repeat) return;
+    switch (e.key) {
+      case '1': waveMode = 0; updateWaveModeHUD(); break;
+      case '2': waveMode = 1; updateWaveModeHUD(); break;
+      case '3': waveMode = 2; updateWaveModeHUD(); break;
+      case ' ':
+        e.preventDefault();
+        if (!audioReady) initAudio();
+        if (audioReady && audioCtx.state === 'suspended') audioCtx.resume();
+        toggleDrone();
+        break;
+      case 'c': case 'C':
+        implosionAmount = 1.0;
+        break;
+      case 'r': case 'R':
+        if (!recording && !playing) {
+          recording = true;
+          recordData = [];
+          recordStart = performance.now();
+          document.getElementById('rec-indicator').style.display = 'block';
+        } else if (recording) {
+          recording = false;
+          document.getElementById('rec-indicator').style.display = 'none';
+          if (recordData.length > 10) {
+            playing = true;
+            playbackStart = performance.now();
+          }
+        } else if (playing) {
+          playing = false;
+          ghostEmitter = null;
+        }
+        break;
+    }
+  });
+}
+
+function updateWaveModeHUD() {
+  const el = document.getElementById('wave-mode');
+  const labels = ['\u223F SINE', '\u2A58 SAW', '\u25B3 TRI'];
+  const classes = ['sine', 'saw', 'tri'];
+  el.textContent = labels[waveMode];
+  el.className = classes[waveMode];
+}
+
+// ─── Recording / Playback ────────────────────────────────────────────
+function handleRecording() {
+  if (recording) {
+    const elapsed = performance.now() - recordStart;
+    if (elapsed > 10000) {
+      recording = false;
+      document.getElementById('rec-indicator').style.display = 'none';
+      if (recordData.length > 10) {
+        playing = true;
+        playbackStart = performance.now();
+      }
+      return;
+    }
+    const ptrs = [];
+    for (const [, ptr] of pointers) {
+      if (ptr.active) ptrs.push({ x: ptr.x, y: ptr.y, vx: ptr.vx, vy: ptr.vy, speed: ptr.speed });
+    }
+    recordData.push({ time: elapsed, pointers: ptrs, waveMode });
+  }
+
+  if (playing && recordData.length > 0) {
+    const duration = recordData[recordData.length - 1].time;
+    if (duration < 1) { playing = false; ghostEmitter = null; return; }
+    const elapsed = (performance.now() - playbackStart) % duration;
+    // Find frame
+    let idx = 0;
+    for (let i = 0; i < recordData.length; i++) {
+      if (recordData[i].time > elapsed) break;
+      idx = i;
+    }
+    const frame = recordData[idx];
+    if (frame.pointers.length > 0) {
+      const p = frame.pointers[0];
+      ghostEmitter = { x: p.x, y: p.y, vx: p.vx || 0, vy: p.vy || 0 };
+      // Ghost audio
+      if (audioReady) {
+        const gv = allocateVoice(-999);
+        if (gv) updateVoice(gv, p.x, p.y, p.speed || 0.2);
+      }
+    } else {
+      ghostEmitter = null;
+      if (audioReady) releaseVoice(-999);
+    }
+  }
+}
+
+// ─── Render Pipeline ─────────────────────────────────────────────────
+function updateParticles(dt) {
+  // Gather emitters
+  emitterPositions.fill(0);
+  emitterVelocities.fill(0);
+  const activeEm = [];
+  for (const [, ptr] of pointers) {
+    if (ptr.active) activeEm.push(ptr);
+  }
+  if (ghostEmitter) activeEm.push(ghostEmitter);
+  const numEm = Math.min(activeEm.length, 8);
+  for (let i = 0; i < numEm; i++) {
+    emitterPositions[i * 2] = activeEm[i].x;
+    emitterPositions[i * 2 + 1] = activeEm[i].y;
+    emitterVelocities[i * 2] = activeEm[i].vx || 0;
+    emitterVelocities[i * 2 + 1] = activeEm[i].vy || 0;
+  }
+
+  // Gather attractors
+  attractorPositions.fill(0);
+  attractorStrengths.fill(0);
+  for (let i = 0; i < Math.min(attractors.length, MAX_ATTRACTORS); i++) {
+    attractorPositions[i * 2] = attractors[i].x;
+    attractorPositions[i * 2 + 1] = attractors[i].y;
+    attractorStrengths[i] = attractors[i].strength;
+  }
+
+  // Upload spectrum
+  if (audioReady && frequencyData) {
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, spectrumTexture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 256, 1, gl.RED, gl.UNSIGNED_BYTE, frequencyData);
+  }
+
+  const src = tfRead;
+  const dst = 1 - tfRead;
+
+  gl.useProgram(particleUpdateProg);
+  gl.uniform1f(particleUpdateUnis.u_dt, dt);
+  gl.uniform1f(particleUpdateUnis.u_time, time);
+  gl.uniform2fv(particleUpdateUnis.u_emitters, emitterPositions);
+  gl.uniform2fv(particleUpdateUnis.u_emitterVels, emitterVelocities);
+  gl.uniform1i(particleUpdateUnis.u_numEmitters, numEm);
+  gl.uniform1f(particleUpdateUnis.u_rms, rms);
+  gl.uniform1f(particleUpdateUnis.u_bass, bass);
+  gl.uniform1f(particleUpdateUnis.u_implosion, implosionAmount);
+  gl.uniform1i(particleUpdateUnis.u_waveMode, waveMode);
+  gl.uniform2fv(particleUpdateUnis.u_attractors, attractorPositions);
+  gl.uniform1fv(particleUpdateUnis.u_attractorStrengths, attractorStrengths);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, spectrumTexture);
+  gl.uniform1i(particleUpdateUnis.u_spectrum, 0);
+
+  gl.enable(gl.RASTERIZER_DISCARD);
+  gl.bindVertexArray(particleVaos[src]);
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tfObj);
+  gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, particleBuffers[dst]);
+  gl.beginTransformFeedback(gl.POINTS);
+  gl.drawArrays(gl.POINTS, 0, MAX_PARTICLES);
+  gl.endTransformFeedback();
+  gl.disable(gl.RASTERIZER_DISCARD);
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+  gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
+  gl.bindVertexArray(null);
+
+  tfRead = dst;
+}
+
+function renderNebula() {
+  gl.useProgram(nebulaProg);
+  gl.uniform1f(nebulaUnis.u_time, time);
+  gl.uniform2f(nebulaUnis.u_resolution, canvas.width, canvas.height);
+  gl.uniform1f(nebulaUnis.u_rms, rms);
+  gl.uniform1f(nebulaUnis.u_dominantFreq, dominantFreq);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function renderParticlesDraw() {
+  gl.useProgram(particleRenderProg);
+  gl.uniform1f(particleRenderUnis.u_zoom, zoom);
+  gl.uniform2f(particleRenderUnis.u_resolution, canvas.width, canvas.height);
+  gl.uniform1f(particleRenderUnis.u_bass, bass);
+  gl.uniform1i(particleRenderUnis.u_waveMode, waveMode);
+  gl.bindVertexArray(particleVaos[tfRead]);
+  gl.drawArrays(gl.POINTS, 0, MAX_PARTICLES);
+}
+
+function renderTrails() {
+  const writeTo = 1 - trailIdx;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, trailFBOs[writeTo].fbo);
+  gl.viewport(0, 0, trailFBOs[writeTo].width, trailFBOs[writeTo].height);
+  gl.useProgram(trailProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, trailFBOs[trailIdx].texture);
+  gl.uniform1i(trailUnis.u_prevTrail, 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, fbScene.texture);
+  gl.uniform1i(trailUnis.u_scene, 1);
+  gl.uniform1f(trailUnis.u_decay, 0.965);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  trailIdx = writeTo;
+}
+
+function renderBloom() {
+  const trailTex = trailFBOs[trailIdx].texture;
+
+  // Threshold + downsample level 0
+  gl.useProgram(bloomDownProg);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomDownFBOs[0].fbo);
+  gl.viewport(0, 0, bloomDownFBOs[0].width, bloomDownFBOs[0].height);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, trailTex);
+  gl.uniform1i(bloomDownUnis.u_source, 0);
+  gl.uniform1f(bloomDownUnis.u_threshold, 0.6);
+  gl.uniform1i(bloomDownUnis.u_applyThreshold, 1);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // Downsample cascade
+  for (let i = 1; i < BLOOM_LEVELS; i++) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, bloomDownFBOs[i].fbo);
+    gl.viewport(0, 0, bloomDownFBOs[i].width, bloomDownFBOs[i].height);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, bloomDownFBOs[i - 1].texture);
+    gl.uniform1i(bloomDownUnis.u_source, 0);
+    gl.uniform1i(bloomDownUnis.u_applyThreshold, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  // Gaussian blur each level (H + V)
+  gl.useProgram(bloomBlurProg);
+  for (let i = 0; i < BLOOM_LEVELS; i++) {
+    const bw = bloomDownFBOs[i].width;
+    const bh = bloomDownFBOs[i].height;
+
+    // H: bloomDown[i] -> bloomBlur[i]
+    gl.bindFramebuffer(gl.FRAMEBUFFER, bloomBlurFBOs[i].fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, bloomDownFBOs[i].texture);
+    gl.uniform1i(bloomBlurUnis.u_source, 0);
+    gl.uniform2f(bloomBlurUnis.u_direction, 1.0 / bw, 0.0);
+    gl.bindVertexArray(emptyVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // V: bloomBlur[i] -> bloomDown[i]
+    gl.bindFramebuffer(gl.FRAMEBUFFER, bloomDownFBOs[i].fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, bloomBlurFBOs[i].texture);
+    gl.uniform2f(bloomBlurUnis.u_direction, 0.0, 1.0 / bh);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+}
+
+function renderComposite() {
+  gl.useProgram(compositeProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, trailFBOs[trailIdx].texture);
+  gl.uniform1i(compositeUnis.u_trail, 0);
+  for (let i = 0; i < 4; i++) {
+    gl.activeTexture(gl.TEXTURE1 + i);
+    if (i < BLOOM_LEVELS) {
+      gl.bindTexture(gl.TEXTURE_2D, bloomDownFBOs[i].texture);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, dummyTexture);
+    }
+    gl.uniform1i(compositeUnis['u_bloom' + i], 1 + i);
+  }
+  gl.uniform1f(compositeUnis.u_caStrength, rms * 0.02);
+  gl.uniform1i(compositeUnis.u_bloomLevels, BLOOM_LEVELS);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// ─── Attractor Update ────────────────────────────────────────────────
+function updateAttractors(dt) {
+  for (let i = attractors.length - 1; i >= 0; i--) {
+    attractors[i].life -= dt;
+    if (attractors[i].life <= 0) {
+      attractors.splice(i, 1);
+      continue;
+    }
+    attractors[i].strength = 2.0 * (attractors[i].life / attractors[i].maxLife);
+  }
+}
+
+// ─── HUD ─────────────────────────────────────────────────────────────
+function updateHUD() {
+  const vuEl = document.getElementById('vu-meter');
+  vuEl.style.height = (Math.min(rms, 1) * 100) + '%';
+}
+
+// ─── Main Render Loop ────────────────────────────────────────────────
+function render(timestamp) {
+  if (lastTime === 0) lastTime = timestamp;
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+  lastTime = timestamp;
+  time += dt;
+
+  // Audio analysis
+  analyzeAudio();
+
+  // Update attractors
+  updateAttractors(dt);
+
+  // Implosion decay
+  if (implosionAmount > 0.001) {
+    implosionAmount *= Math.exp(-dt * 3.0);
+    if (implosionAmount < 0.001) implosionAmount = 0;
+  }
+
+  // Recording / playback
+  handleRecording();
+
+  // Transform feedback: update particles
+  updateParticles(dt);
+
+  // Render to scene FBO
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbScene.fbo);
+  gl.viewport(0, 0, fbScene.width, fbScene.height);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // Nebula background
+  gl.disable(gl.BLEND);
+  renderNebula();
+
+  // Particles (additive)
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);
+  renderParticlesDraw();
+  gl.disable(gl.BLEND);
+
+  // Trail pass
+  renderTrails();
+
+  // Bloom
+  renderBloom();
+
+  // Composite to screen
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  renderComposite();
+
+  // HUD
+  updateHUD();
+
+  requestAnimationFrame(render);
+}
+
+// ─── Init ────────────────────────────────────────────────────────────
+function init() {
+  if (!initGL()) return;
+  initShaders();
+  initParticles();
+  // Framebuffers already initialized in handleResize -> initFramebuffers
+  setupInput();
+  updateWaveModeHUD();
+
+  // Auto-fade hints after 5s
+  setTimeout(() => {
+    const hints = document.getElementById('hints');
+    if (hints) hints.style.opacity = '0';
+  }, 5000);
+
+  requestAnimationFrame(render);
+}
+
+init();
+</script>
+</body>
+</html>
