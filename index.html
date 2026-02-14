@@ -265,7 +265,7 @@ void main(){
   vec2 pos=a_position*u_zoom;
   pos.x/=aspect;
   gl_Position=vec4(pos,0.0,1.0);
-  float lifeAlpha=smoothstep(0.0,0.3,a_life)*smoothstep(5.5,3.0,a_life);
+  float lifeAlpha=smoothstep(0.0,0.3,a_life)*(1.0-smoothstep(3.0,5.5,a_life));
   gl_PointSize=(2.0+lifeAlpha*5.0)*(1.0+u_bass*1.2)*min(u_zoom,2.5);
   gl_PointSize=clamp(gl_PointSize,1.0,40.0);
   v_color=a_color*lifeAlpha;
@@ -757,38 +757,41 @@ function initShaders() {
   // 1. Particle update (transform feedback)
   particleUpdateProg = createProgram(PARTICLE_UPDATE_VS, PARTICLE_UPDATE_FS,
     ['v_position', 'v_velocity', 'v_color', 'v_life']);
+  // 2. Particle render
+  particleRenderProg = createProgram(PARTICLE_RENDER_VS, PARTICLE_RENDER_FS);
+  // 3. Nebula
+  nebulaProg = createProgram(FULLSCREEN_VS, NEBULA_FS);
+  // 4. Trail
+  trailProg = createProgram(FULLSCREEN_VS, TRAIL_FS);
+  // 5. Bloom downsample
+  bloomDownProg = createProgram(FULLSCREEN_VS, BLOOM_DOWN_FS);
+  // 6. Bloom blur
+  bloomBlurProg = createProgram(FULLSCREEN_VS, BLOOM_BLUR_FS);
+  // 7. Composite
+  compositeProg = createProgram(FULLSCREEN_VS, COMPOSITE_FS);
+
+  if (!particleUpdateProg || !particleRenderProg || !nebulaProg || !trailProg ||
+      !bloomDownProg || !bloomBlurProg || !compositeProg) {
+    document.getElementById('fallback').textContent = 'Shader compilation failed. Your GPU/driver may not support the required features.';
+    document.getElementById('fallback').classList.add('show');
+    document.getElementById('hud').style.display = 'none';
+    return false;
+  }
+
   particleUpdateUnis = getUniforms(particleUpdateProg, [
     'u_dt','u_time','u_emitters','u_emitterVels','u_numEmitters',
     'u_rms','u_bass','u_implosion','u_waveMode',
     'u_attractors','u_attractorStrengths','u_spectrum'
   ]);
-
-  // 2. Particle render
-  particleRenderProg = createProgram(PARTICLE_RENDER_VS, PARTICLE_RENDER_FS);
   particleRenderUnis = getUniforms(particleRenderProg, [
     'u_zoom','u_resolution','u_bass','u_waveMode'
   ]);
-
-  // 3. Nebula
-  nebulaProg = createProgram(FULLSCREEN_VS, NEBULA_FS);
   nebulaUnis = getUniforms(nebulaProg, [
     'u_time','u_resolution','u_rms','u_dominantFreq'
   ]);
-
-  // 4. Trail
-  trailProg = createProgram(FULLSCREEN_VS, TRAIL_FS);
   trailUnis = getUniforms(trailProg, ['u_prevTrail','u_scene','u_decay']);
-
-  // 5. Bloom downsample
-  bloomDownProg = createProgram(FULLSCREEN_VS, BLOOM_DOWN_FS);
   bloomDownUnis = getUniforms(bloomDownProg, ['u_source','u_threshold','u_applyThreshold']);
-
-  // 6. Bloom blur
-  bloomBlurProg = createProgram(FULLSCREEN_VS, BLOOM_BLUR_FS);
   bloomBlurUnis = getUniforms(bloomBlurProg, ['u_source','u_direction']);
-
-  // 7. Composite
-  compositeProg = createProgram(FULLSCREEN_VS, COMPOSITE_FS);
   compositeUnis = getUniforms(compositeProg, [
     'u_trail','u_bloom0','u_bloom1','u_bloom2','u_bloom3','u_caStrength','u_bloomLevels'
   ]);
@@ -1308,7 +1311,7 @@ function render(timestamp) {
 // ─── Init ────────────────────────────────────────────────────────────
 function init() {
   if (!initGL()) return;
-  initShaders();
+  if (initShaders() === false) return;
   initParticles();
   // Framebuffers already initialized in handleResize -> initFramebuffers
   setupInput();
